@@ -12,7 +12,7 @@ require (
 	github.com/ethersphere/go-storage-incentives-abi v0.3.0
 	github.com/ethersphere/go-sw3-abi v0.4.0
 	github.com/ethersphere/langos v1.0.0
-	github.com/gogo/protobuf v1.3.1
+	github.com/gogo/protobuf v1.3.2
 	github.com/golang/groupcache v0.0.0-20200121045136-8c9f03a8e57e // indirect
 	github.com/google/go-cmp v0.5.0
 	github.com/google/gopacket v1.1.19 // indirect
