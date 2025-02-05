@@ -5,35 +5,42 @@
 package api_test
 
 import (
+	"bytes"
+	"context"
 	"encoding/hex"
+	"fmt"
 	"net/http"
+	"strconv"
 	"testing"
+	"time"
 
-	"github.com/ethersphere/bee/pkg/api"
-	"github.com/ethersphere/bee/pkg/jsonhttp"
-	"github.com/ethersphere/bee/pkg/jsonhttp/jsonhttptest"
-	"github.com/ethersphere/bee/pkg/log"
-	statestore "github.com/ethersphere/bee/pkg/statestore/mock"
-	"github.com/ethersphere/bee/pkg/steward/mock"
-	smock "github.com/ethersphere/bee/pkg/storage/mock"
-	"github.com/ethersphere/bee/pkg/swarm"
-	"github.com/ethersphere/bee/pkg/tags"
+	"github.com/ethersphere/bee/v2/pkg/api"
+	"github.com/ethersphere/bee/v2/pkg/file/redundancy"
+	"github.com/ethersphere/bee/v2/pkg/jsonhttp"
+	"github.com/ethersphere/bee/v2/pkg/jsonhttp/jsonhttptest"
+	"github.com/ethersphere/bee/v2/pkg/log"
+	mockpost "github.com/ethersphere/bee/v2/pkg/postage/mock"
+	"github.com/ethersphere/bee/v2/pkg/steward"
+	"github.com/ethersphere/bee/v2/pkg/steward/mock"
+	"github.com/ethersphere/bee/v2/pkg/storage"
+	mockstorer "github.com/ethersphere/bee/v2/pkg/storer/mock"
+	"github.com/ethersphere/bee/v2/pkg/swarm"
+	"gitlab.com/nolash/go-mockbytes"
 )
 
 // nolint:paralleltest
 func TestStewardship(t *testing.T) {
 	var (
-		logger         = log.Noop
-		statestoreMock = statestore.NewStateStore()
-		stewardMock    = &mock.Steward{}
-		storer         = smock.NewStorer()
-		addr           = swarm.NewAddress([]byte{31: 128})
+		logger      = log.Noop
+		stewardMock = &mock.Steward{}
+		storer      = mockstorer.New()
+		addr        = swarm.NewAddress([]byte{31: 128})
 	)
 	client, _, _, _ := newTestServer(t, testServerOptions{
 		Storer:  storer,
-		Tags:    tags.NewTags(statestoreMock, logger),
 		Logger:  logger,
 		Steward: stewardMock,
+		Post:    mockpost.New(mockpost.WithAcceptAll()),
 	})
 
 	t.Run("re-upload", func(t *testing.T) {
@@ -42,6 +49,7 @@ func TestStewardship(t *testing.T) {
 				Message: http.StatusText(http.StatusOK),
 				Code:    http.StatusOK,
 			}),
+			jsonhttptest.WithRequestHeader("Swarm-Postage-Batch-Id", "aa"),
 		)
 		if !stewardMock.LastAddress().Equal(addr) {
 			t.Fatalf("\nhave address: %q\nwant address: %q", stewardMock.LastAddress().String(), addr.String())
@@ -61,10 +69,64 @@ func TestStewardship(t *testing.T) {
 	})
 }
 
-func Test_stewardshipHandlers_invalidInputs(t *testing.T) {
+type localRetriever struct {
+	getter storage.Getter
+}
+
+func (lr *localRetriever) RetrieveChunk(ctx context.Context, addr, sourceAddr swarm.Address) (chunk swarm.Chunk, err error) {
+	ch, err := lr.getter.Get(ctx, addr)
+	if err != nil {
+		return nil, fmt.Errorf("retrieve chunk %s: %w", addr, err)
+	}
+	return ch, nil
+}
+
+func TestStewardshipWithRedundancy(t *testing.T) {
 	t.Parallel()
 
-	client, _, _, _ := newTestServer(t, testServerOptions{})
+	var (
+		storerMock      = mockstorer.New()
+		localRetrieval  = &localRetriever{getter: storerMock.ChunkStore()}
+		s               = steward.New(storerMock, localRetrieval, storerMock.Cache())
+		client, _, _, _ = newTestServer(t, testServerOptions{
+			Storer:  storerMock,
+			Logger:  log.Noop,
+			Steward: s,
+			Post:    mockpost.New(mockpost.WithAcceptAll()),
+		})
+	)
+
+	g := mockbytes.New(0, mockbytes.MockTypeStandard).WithModulus(255)
+	content, err := g.SequentialBytes(512000) // 500KB
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, l := range []redundancy.Level{redundancy.NONE, redundancy.MEDIUM, redundancy.STRONG, redundancy.INSANE, redundancy.PARANOID} {
+		t.Run(fmt.Sprintf("rLevel-%d", l), func(t *testing.T) {
+			res := new(api.BytesPostResponse)
+			jsonhttptest.Request(t, client, http.MethodPost, "/bytes", http.StatusCreated,
+				jsonhttptest.WithRequestHeader(api.SwarmDeferredUploadHeader, "true"),
+				jsonhttptest.WithRequestHeader(api.SwarmPostageBatchIdHeader, batchOkStr),
+				jsonhttptest.WithRequestHeader(api.SwarmRedundancyLevelHeader, strconv.Itoa(int(l))),
+				jsonhttptest.WithRequestBody(bytes.NewReader(content)),
+				jsonhttptest.WithUnmarshalJSONResponse(res),
+			)
+
+			time.Sleep(2 * time.Second)
+			jsonhttptest.Request(t, client, http.MethodGet, "/stewardship/"+res.Reference.String(), http.StatusOK,
+				jsonhttptest.WithExpectedJSONResponse(api.IsRetrievableResponse{IsRetrievable: true}),
+			)
+		})
+	}
+}
+
+func TestStewardshipInvalidInputs(t *testing.T) {
+	t.Parallel()
+
+	client, _, _, _ := newTestServer(t, testServerOptions{
+		Storer: mockstorer.New(),
+	})
 
 	tests := []struct {
 		name    string
@@ -99,9 +161,7 @@ func Test_stewardshipHandlers_invalidInputs(t *testing.T) {
 	}}
 
 	for _, method := range []string{http.MethodGet, http.MethodPut} {
-		method := method
 		for _, tc := range tests {
-			tc := tc
 			t.Run(method+" "+tc.name, func(t *testing.T) {
 				t.Parallel()
 
@@ -111,4 +171,33 @@ func Test_stewardshipHandlers_invalidInputs(t *testing.T) {
 			})
 		}
 	}
+
+	t.Run("batch with id not found", func(t *testing.T) {
+		t.Parallel()
+
+		jsonhttptest.Request(t, client, http.MethodPut, "/stewardship/1234", http.StatusNotFound,
+			jsonhttptest.WithRequestHeader(api.SwarmPostageBatchIdHeader, "1234"),
+			jsonhttptest.WithExpectedJSONResponse(jsonhttp.StatusResponse{
+				Code:    http.StatusNotFound,
+				Message: "batch with id not found",
+			}),
+		)
+	})
+	t.Run("invalid batch id", func(t *testing.T) {
+		t.Parallel()
+
+		jsonhttptest.Request(t, client, http.MethodPut, "/stewardship/1234", http.StatusBadRequest,
+			jsonhttptest.WithRequestHeader(api.SwarmPostageBatchIdHeader, "1234G"),
+			jsonhttptest.WithExpectedJSONResponse(jsonhttp.StatusResponse{
+				Code:    http.StatusBadRequest,
+				Message: "invalid header params",
+				Reasons: []jsonhttp.Reason{
+					{
+						Field: api.SwarmPostageBatchIdHeader,
+						Error: api.HexInvalidByteError('G').Error(),
+					},
+				},
+			}),
+		)
+	})
 }

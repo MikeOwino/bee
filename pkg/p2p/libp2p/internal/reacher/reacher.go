@@ -11,39 +11,29 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ethersphere/bee/pkg/p2p"
-	"github.com/ethersphere/bee/pkg/swarm"
+	"github.com/ethersphere/bee/v2/pkg/p2p"
+	"github.com/ethersphere/bee/v2/pkg/swarm"
 	ma "github.com/multiformats/go-multiaddr"
 )
 
 const (
-	pingTimeout        = time.Second * 5
-	pingMaxAttempts    = 3
-	workers            = 8
-	retryAfterDuration = time.Second * 15
-)
-
-type peerState int
-
-const (
-	waiting peerState = iota
-	inProgress
+	pingTimeout        = time.Second * 15
+	workers            = 16
+	retryAfterDuration = time.Minute * 5
 )
 
 type peer struct {
 	overlay    swarm.Address
 	addr       ma.Multiaddr
 	retryAfter time.Time
-	attempts   int
-	state      peerState
 }
 
 type reacher struct {
 	mu    sync.Mutex
 	peers map[string]*peer
 
-	work chan struct{}
-	quit chan struct{}
+	newPeer chan struct{}
+	quit    chan struct{}
 
 	pinger   p2p.Pinger
 	notifier p2p.ReachableNotifier
@@ -56,7 +46,6 @@ type reacher struct {
 
 type Options struct {
 	PingTimeout        time.Duration
-	PingMaxAttempts    int
 	Workers            int
 	RetryAfterDuration time.Duration
 }
@@ -64,7 +53,7 @@ type Options struct {
 func New(streamer p2p.Pinger, notifier p2p.ReachableNotifier, o *Options) *reacher {
 
 	r := &reacher{
-		work:     make(chan struct{}, 1),
+		newPeer:  make(chan struct{}, 1),
 		quit:     make(chan struct{}),
 		pinger:   streamer,
 		peers:    make(map[string]*peer),
@@ -75,7 +64,6 @@ func New(streamer p2p.Pinger, notifier p2p.ReachableNotifier, o *Options) *reach
 	if o == nil {
 		o = &Options{
 			PingTimeout:        pingTimeout,
-			PingMaxAttempts:    pingMaxAttempts,
 			Workers:            workers,
 			RetryAfterDuration: retryAfterDuration,
 		}
@@ -115,7 +103,7 @@ func (r *reacher) manage() {
 			select {
 			case <-r.quit:
 				return
-			case <-r.work:
+			case <-r.newPeer:
 				continue
 			case <-time.After(tryAfter):
 				continue
@@ -127,12 +115,12 @@ func (r *reacher) manage() {
 			select {
 			case <-r.quit:
 				return
-			case <-r.work:
+			case <-r.newPeer:
 				continue
 			}
 		}
 
-		// send p to channel
+		// ping peer
 		select {
 		case <-r.quit:
 			return
@@ -147,14 +135,6 @@ func (r *reacher) ping(c chan *peer, ctx context.Context) {
 
 	for p := range c {
 
-		r.mu.Lock()
-		p.attempts++
-		var (
-			overlay  = p.overlay
-			attempts = p.attempts
-		)
-		r.mu.Unlock()
-
 		now := time.Now()
 
 		ctxt, cancel := context.WithTimeout(ctx, r.options.PingTimeout)
@@ -165,28 +145,12 @@ func (r *reacher) ping(c chan *peer, ctx context.Context) {
 		if err == nil {
 			r.metrics.Pings.WithLabelValues("success").Inc()
 			r.metrics.PingTime.WithLabelValues("success").Observe(time.Since(now).Seconds())
-			r.notifier.Reachable(overlay, p2p.ReachabilityStatusPublic)
-			r.deletePeer(p)
-			continue
+			r.notifier.Reachable(p.overlay, p2p.ReachabilityStatusPublic)
+		} else {
+			r.metrics.Pings.WithLabelValues("failure").Inc()
+			r.metrics.PingTime.WithLabelValues("failure").Observe(time.Since(now).Seconds())
+			r.notifier.Reachable(p.overlay, p2p.ReachabilityStatusPrivate)
 		}
-
-		r.metrics.Pings.WithLabelValues("failure").Inc()
-		r.metrics.PingTime.WithLabelValues("failure").Observe(time.Since(now).Seconds())
-
-		// max attempts have been reached
-		if attempts >= r.options.PingMaxAttempts {
-			r.notifier.Reachable(overlay, p2p.ReachabilityStatusPrivate)
-			r.deletePeer(p)
-			continue
-		}
-
-		// mark peer as 'waiting', increase retry-after duration, and notify workers about more work
-		r.mu.Lock()
-		p.state = waiting
-		p.retryAfter = time.Now().Add(r.options.RetryAfterDuration * time.Duration(attempts))
-		r.mu.Unlock()
-
-		r.notifyManage()
 	}
 }
 
@@ -194,18 +158,16 @@ func (r *reacher) tryAcquirePeer() (*peer, time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	now := time.Now()
-	nextClosest := time.Time{}
+	var (
+		now         = time.Now()
+		nextClosest time.Time
+	)
 
 	for _, p := range r.peers {
 
-		if p.state == inProgress {
-			continue
-		}
-
-		// here, retry after is in the past so we can ping this peer
+		// retry after has expired, retry
 		if now.After(p.retryAfter) {
-			p.state = inProgress
+			p.retryAfter = time.Now().Add(r.options.RetryAfterDuration)
 			return p, 0
 		}
 
@@ -223,20 +185,6 @@ func (r *reacher) tryAcquirePeer() (*peer, time.Duration) {
 	return nil, time.Until(nextClosest)
 }
 
-func (r *reacher) notifyManage() {
-	select {
-	case r.work <- struct{}{}:
-	default:
-	}
-}
-
-func (r *reacher) deletePeer(p *peer) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	delete(r.peers, p.overlay.ByteString())
-}
-
 // Connected adds a new peer to the queue for testing reachability.
 func (r *reacher) Connected(overlay swarm.Address, addr ma.Multiaddr) {
 	r.mu.Lock()
@@ -246,7 +194,10 @@ func (r *reacher) Connected(overlay swarm.Address, addr ma.Multiaddr) {
 		r.peers[overlay.ByteString()] = &peer{overlay: overlay, addr: addr}
 	}
 
-	r.notifyManage()
+	select {
+	case r.newPeer <- struct{}{}:
+	default:
+	}
 }
 
 // Disconnected removes a peer from the queue.

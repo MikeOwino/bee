@@ -11,12 +11,12 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethersphere/bee/pkg/api"
-	"github.com/ethersphere/bee/pkg/crypto"
-	"github.com/ethersphere/bee/pkg/jsonhttp"
-	"github.com/ethersphere/bee/pkg/jsonhttp/jsonhttptest"
-	"github.com/ethersphere/bee/pkg/p2p/mock"
-	"github.com/ethersphere/bee/pkg/swarm"
+	"github.com/ethersphere/bee/v2/pkg/api"
+	"github.com/ethersphere/bee/v2/pkg/crypto"
+	"github.com/ethersphere/bee/v2/pkg/jsonhttp"
+	"github.com/ethersphere/bee/v2/pkg/jsonhttp/jsonhttptest"
+	"github.com/ethersphere/bee/v2/pkg/p2p/mock"
+	"github.com/ethersphere/bee/v2/pkg/swarm"
 	"github.com/multiformats/go-multiaddr"
 )
 
@@ -40,7 +40,6 @@ func TestAddresses(t *testing.T) {
 	ethereumAddress := common.HexToAddress("abcd")
 
 	testServer, _, _, _ := newTestServer(t, testServerOptions{
-		DebugAPI:        true,
 		PublicKey:       privateKey.PublicKey,
 		PSSPublicKey:    pssPrivateKey.PublicKey,
 		Overlay:         overlay,
@@ -58,6 +57,7 @@ func TestAddresses(t *testing.T) {
 				Overlay:      &overlay,
 				Underlay:     addresses,
 				Ethereum:     ethereumAddress,
+				ChainAddress: ethereumAddress,
 				PublicKey:    hex.EncodeToString(crypto.EncodeSecp256k1PublicKey(&privateKey.PublicKey)),
 				PSSPublicKey: hex.EncodeToString(crypto.EncodeSecp256k1PublicKey(&pssPrivateKey.PublicKey)),
 			}),
@@ -79,7 +79,6 @@ func TestAddresses_error(t *testing.T) {
 	testErr := errors.New("test error")
 
 	testServer, _, _, _ := newTestServer(t, testServerOptions{
-		DebugAPI: true,
 		P2P: mock.New(mock.WithAddressesFunc(func() ([]multiaddr.Multiaddr, error) {
 			return nil, testErr
 		})),
